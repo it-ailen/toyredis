@@ -31,6 +31,13 @@ impl SDS {
         Self { cur_len: 0, free: 0, data: vec![], }
     }
 
+    /// 初始化一个 SDS
+    pub fn new(init: &[u8]) -> Self {
+        let mut inst = Self::empty();
+        inst.append(init);
+        inst
+    }
+
     /// 清除所有内容。
     pub fn clear(&mut self) {
         *self = Self::empty();

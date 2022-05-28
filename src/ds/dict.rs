@@ -3,25 +3,38 @@
 //! redis 的 sds 采用 siphash 方法，这在 std::hash 中有提供，所以直接使用
 //! 
 
-use std::{hash::{Hash, Hasher}, collections::hash_map::DefaultHasher, borrow::{BorrowMut, Borrow}};
+use std::{hash::{Hash, Hasher, BuildHasher}, collections::hash_map::{RandomState}, borrow::{Borrow}, fmt::Debug};
 
 use super::perfstr::sds::SDS;
 
 /// redis 版本 hash table，由两个 hash table 交替组成，支持渐进式 rehash（即将单次全部 rehash 这样的耗时逻辑处理成一次请求处理若干个 slot 的渐进方式）。
-pub struct Dict<V> {
-    main_table: HashTable<SDS, V>,
-    back_table: Option<HashTable<SDS, V>>,
+pub struct Dict<V, S: BuildHasher = DefaultHasherBuilder> {
+    main_table: HashTable<SDS, V, S>,
+    back_table: Option<HashTable<SDS, V, S>>,
     /// 正在 rehashing?
     /// rehash 所在的 slot index，这个只针对 main_table
     rehash_idx: Option<usize>,
+    hasher_builder: S,
 }
 
-impl<V: Default> Dict<V> {
+impl<V: Default> Dict<V, DefaultHasherBuilder> {
     pub fn new() -> Self {
         Self { 
-            main_table: HashTable::<SDS, V>::with_capacity(0), 
+            main_table: HashTable::with_capacity_and_hasher(4, DefaultHasherBuilder::default()), 
             back_table: None, 
             rehash_idx: None,
+            hasher_builder: DefaultHasherBuilder::default(),
+        }
+    }
+}
+
+impl <V: Default, S: BuildHasher + Clone> Dict<V, S> {
+    pub fn new_with_hasher(hasher_builder: S) ->Self {
+        Self {
+            main_table: HashTable::with_capacity_and_hasher(4, hasher_builder.clone()),
+            back_table: None,
+            rehash_idx: None,
+            hasher_builder: hasher_builder,
         }
     }
 
@@ -34,7 +47,7 @@ impl<V: Default> Dict<V> {
             return
         }
         // 每次扩2倍
-        self.back_table = Some(HashTable::with_capacity(2*self.main_table.slots_cnt())); 
+        self.back_table = Some(HashTable::with_capacity_and_hasher(2*self.main_table.slots_cnt(), self.hasher_builder.clone())); 
         self.rehash_idx = Some(0);
     }
 
@@ -44,7 +57,7 @@ impl<V: Default> Dict<V> {
         if !self.is_rehashing() {
             return;
         }
-        let mut start_idx = self.rehash_idx.unwrap();
+        let start_idx = self.rehash_idx.unwrap();
         let mut latest_idx = start_idx;
         let max_slots_idx_to_check = (10 * step + start_idx).max(self.main_table.slots_cnt() as usize - 1);
         for idx in start_idx..=max_slots_idx_to_check {
@@ -131,6 +144,11 @@ impl<V: Default> Dict<V> {
     }
 
     /// 查找 value
+    /// # Example
+    /// ```
+    ///     let d = Dict::new();
+    ///     d.insert(super::perfstr::sds::SDS::new("key"))
+    /// ```
     pub fn get(&mut self, key: &SDS) -> Option<&V> {
         if self.value_cnt() == 0 {
             return None;
@@ -142,13 +160,140 @@ impl<V: Default> Dict<V> {
     }
 }
 
+#[cfg(test)]
+mod dict_tests {
+    use std::hash::{BuildHasher, Hasher};
+
+    use crate::ds::perfstr::sds::SDS;
+
+    use super::Dict;
+
+    #[test]
+    fn test_basis() {
+        let mut dict = Dict::new();
+        dict.insert(SDS::new("key".as_bytes()), "value".to_string());
+        let key = SDS::new("key".as_bytes());
+        assert_eq!(*dict.get(&key).unwrap(), "value".to_string());
+        assert_eq!(dict.remove(&key).unwrap(), "value".to_string());
+        assert!(dict.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_expand_with_default_hasher() {
+        let mut dict = Dict::new();
+        assert_eq!(dict.main_table.slot_cnt_exp, 2);
+        assert_eq!(dict.main_table.slots.len(), 1 << 2);
+        assert_eq!(dict.main_table.cnt, 0);
+        assert_eq!(dict.value_cnt(), 0);
+        assert!(dict.back_table.is_none());
+        assert!(!dict.is_rehashing());
+        for idx in 0..3 {
+            dict.insert(SDS::new(&[idx]), idx);
+        }
+        assert_eq!(dict.main_table.slot_cnt_exp, 2);
+        assert_eq!(dict.main_table.slots.len(), 1 << 2);
+        assert_eq!(dict.main_table.cnt, 3);
+        assert_eq!(dict.value_cnt(), 3);
+        assert!(dict.back_table.is_none());
+        assert!(!dict.is_rehashing());
+        // 加入第4个，只进入 rehashing 状态，但还没真正开始
+        dict.insert(SDS::new(&[4]), 4); 
+        assert_eq!(dict.main_table.slot_cnt_exp, 2);
+        assert_eq!(dict.main_table.slots.len(), 1 << 2);
+        assert_eq!(dict.main_table.cnt, 4);
+        assert_eq!(dict.value_cnt(), 4);
+        assert!(dict.back_table.is_some());
+        assert!(dict.is_rehashing()); 
+        // 下面要 rehash 了
+        dict.insert(SDS::new(&[5]), 5);
+        assert_eq!(dict.main_table.slot_cnt_exp, 2);
+        assert_eq!(dict.main_table.slots.len(), 1 << 2);
+        assert_eq!(dict.back_table.as_ref().unwrap().slot_cnt_exp, 3);
+        assert_eq!(dict.back_table.as_ref().unwrap().slots.len(), 1<< 3);
+        assert_eq!(dict.value_cnt(), 5);
+        assert!(dict.is_rehashing());
+        assert!(dict.back_table.is_some());
+        assert!(dict.back_table.as_ref().unwrap().cnt >= 1);
+        let key = SDS::new(&[5]);
+
+        assert!(dict.back_table.as_ref()
+            .unwrap()
+            .get(&key)
+            .is_some());
+        assert!(dict.main_table.get(&key).is_none());
+    }
+
+    #[derive(Clone)]
+    struct DebugHasherBuilder;
+
+    impl BuildHasher for DebugHasherBuilder {
+        type Hasher=DebugHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            Self::Hasher{first_byte: 0}
+        }
+    }
+
+    struct DebugHasher{
+        first_byte: u8,
+    }
+
+    impl Hasher for DebugHasher {
+        fn finish(&self) -> u64 {
+            self.first_byte as u64
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            if bytes.len() > 0 {
+                self.first_byte = bytes[0];
+            }
+        }
+    }
+    #[test]
+    fn test_custom_hasher() {
+        let hasher = DebugHasherBuilder{};
+        let mut dict = Dict::new_with_hasher(hasher);
+        dict.insert(SDS::new(&[0]), 0);
+        dict.insert(SDS::new(&[4]), 4);
+        assert_eq!(dict.value_cnt(), 2);
+        for idx in 1..4 {
+            assert!(dict.main_table.slots[idx].is_none());
+        }
+        dict.insert(SDS::new(&[2]), 2);
+        dict.insert(SDS::new(&[6]), 6);
+        assert!(dict.main_table.slots[1].is_none());
+        assert!(dict.main_table.slots[3].is_none());
+        assert!(dict.is_rehashing());
+        dict.insert(SDS::new(&[7]), 7);
+        assert!(dict.is_rehashing());
+        assert_eq!(dict.value_cnt(), 5);
+        assert_eq!(dict.main_table.cnt, 2);
+        assert!(dict.main_table.slots[0].is_none());
+        assert_eq!(dict.back_table.as_ref().unwrap().cnt, 3);
+        assert!(dict.back_table.as_ref().unwrap().slots[0].is_some());
+        assert!(dict.back_table.as_ref().unwrap().slots[4].is_some());
+        assert!(dict.back_table.as_ref().unwrap().slots[7].is_some());
+        let key = SDS::new(&[7]);
+        dict.get(&key);
+        assert!(!dict.is_rehashing());
+        assert!(dict.main_table.slots[0].is_some());
+        assert!(dict.main_table.slots[2].is_some());
+        assert!(dict.main_table.slots[4].is_some());
+        assert!(dict.main_table.slots[6].is_some());
+        assert!(dict.main_table.slots[7].is_some());
+        
+    }
+}
+
 /// 非 rust 内置的 hash table，用于对齐 redis 实现，自己实现主要是为了支持渐进式 rehash。
-struct HashTable<K: Hash, V> {
+struct HashTable<K: Hash, V, S> 
+where S: BuildHasher {
     slots: Vec<HashEntry<K, V>>,
     /// 当前 hash table 中存在的数据量
     cnt: u64,
     /// slots 数以2为底的指数值，即 self.slots.len() = 1usize << self.slot_cnt_exp。这是为了方便分配及取模
     slot_cnt_exp: u64,
+    hasher_builder: S, // 用于计算 hash 的方法
 }
 
 type HashEntry<K, V> = Option<Box<Node<K, V>>>;
@@ -174,17 +319,28 @@ macro_rules! remain {
 }
 
 
-const MIN_EXP: u64 = 3;
+const MIN_EXP: u64 = 2;
+type DefaultHasherBuilder = RandomState;
 
-impl<K, V: Default> HashTable<K, V>
-where K: Eq + Hash, 
+impl<K, V: Default> HashTable<K, V, DefaultHasherBuilder> 
+where K: Eq + Hash,
 {
     pub fn with_capacity(size: u64) -> Self {
+        Self::with_capacity_and_hasher(size, DefaultHasherBuilder::default())
+    }
+}
+
+impl<K, V: Default, S> HashTable<K, V, S>
+where K: Eq + Hash,
+S: BuildHasher,
+{
+    pub fn with_capacity_and_hasher(size: u64, hasher_builder: S) -> Self 
+    {
         let slot_cnt_exp = Self::compute_exp(size);
         let size = (1u64<<slot_cnt_exp) as usize;
         let mut slots = Vec::new();
         slots.resize_with(size, || None);
-        Self { slots, cnt: 0, slot_cnt_exp}
+        Self { slots, cnt: 0, slot_cnt_exp, hasher_builder} 
     }
 
     fn slots_cnt(&self) -> u64 {
@@ -207,11 +363,11 @@ where K: Eq + Hash,
         64
     }
 
-    fn gen_hash<Q: ?Sized>(key: &Q) -> u64
-        where K: Borrow<Q>,
-        Q: Hash + Eq, 
+    fn gen_hash<T>(&self, key: T) -> u64
+        where T: Hash, 
     {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = self.hasher_builder.build_hasher();
+        // let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         hasher.finish()
     }
@@ -221,7 +377,7 @@ where K: Eq + Hash,
     where K: Borrow<Q>,
         Q: Hash + Eq + ?Sized, 
     {
-        let hash = Self::gen_hash(key);
+        let hash = self.gen_hash(key);
         let slot_idx = remain!(hash, self.slot_cnt_exp);
         let mut cursor = self.slots[slot_idx].as_ref();
         while let Some(cur) = cursor {
@@ -235,7 +391,7 @@ where K: Eq + Hash,
 
     /// 插入 key，并返回原有值.
     pub fn insert(&mut self, key: K, v: V) -> Option<V> {
-        let hash = Self::gen_hash(key.borrow());
+        let hash = self.gen_hash(key.borrow());
         let slot_idx = remain!(hash, self.slot_cnt_exp); 
         let mut cursor = &mut self.slots[slot_idx];
         loop {
@@ -263,7 +419,7 @@ where K: Eq + Hash,
         where K: Borrow<Q>,
         Q: Hash + Eq + ?Sized, 
     {
-        let hash = Self::gen_hash(key);
+        let hash = self.gen_hash(key);
         let slot_idx = remain!(hash, self.slot_cnt_exp);
         if self.slots[slot_idx].is_none() {
             return None
