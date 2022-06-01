@@ -41,9 +41,9 @@ struct Node<Member: PartialEq> {
     /// 存入数据
     pub data: Member,
     /// 各层链表。层级越高，索引级别越高。
-    levels: Vec<*mut Node<Member>>,
+    pub levels: Vec<*mut Node<Member>>,
     /// 指向前一个节点
-    backward: *mut Node<Member>,
+    pub backward: *mut Node<Member>,
 }
 
 impl<T: PartialEq + Debug> Debug for Node<T> {
@@ -200,6 +200,7 @@ where Member: Ord
                                 (*new_node).backward = slow;
                             }
                         }
+                        break 'out;
                     },
                     Ordering::Equal => {
                         // 不允许重复插入
@@ -284,6 +285,23 @@ where Member: Ord
         self.do_find(score, data).is_some()
     }
 
+    pub fn clear(&mut self) -> usize {
+        if self.length == 0 {
+            return 0
+        }
+        let count = self.length;
+        self.length = 0;
+        self.level = 0;
+        while !self.level_links[0].is_null() {
+            let node = unsafe {
+                Box::from_raw(self.level_links[0])
+            };
+            self.level_links[0] = node.levels[0];
+        }
+        self.level_links.clear();
+        count
+    }
+
     pub fn remove(&mut self, score: f64, data: &Member) -> bool {
         if self.length == 0 {
             return false;
@@ -323,8 +341,10 @@ where Member: Ord
                         }
                         if cur_level == 0 {
                             if !slow.is_null() {
-                                unsafe {
-                                    (*(*next).levels[0]).backward = slow;
+                                if !(unsafe {(*next).levels[0]}.is_null()) {
+                                    unsafe {
+                                        (*(*next).levels[0]).backward = slow;
+                                    }
                                 }
                             }
                             self.length -= 1;
@@ -400,7 +420,7 @@ where Member: Ord
                         first = next;
                         while !pre.is_null() {
                             let pre_score = unsafe {(*pre).score};
-                            if pre_score <= min_score {
+                            if pre_score >= min_score {
                                 first = pre;
                                 pre = unsafe{ (*pre).backward };
                                 continue;
@@ -408,6 +428,7 @@ where Member: Ord
                                 break;
                             }
                         }
+                        break 'out;
                     } else {
                         // 起始点在下一个区间
                         slow = next;
@@ -458,8 +479,6 @@ impl<Member: PartialEq> Node<Member> {
 
 #[cfg(test)]
 mod test {
-    use crate::ds::skiplist::RangeItem;
-
     use super::Skiplist;
 
     #[test]
@@ -476,5 +495,95 @@ mod test {
         assert!(list.remove(2f64, &2));
         assert_eq!(list.length, 0);
         assert_eq!(list.level, 2);
+    }
+
+    #[test]
+    fn check_clear() {
+        let mut list = Skiplist::new();
+        list.do_insert(22, 22f64, 1);
+        assert_eq!(list.level, 1);
+        assert_eq!(list.length, 1);
+        list.do_insert(19, 19f64, 2);
+        assert_eq!(list.level, 2);
+        assert_eq!(list.length, 2);
+        list.do_insert(7, 7f64, 4);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 3);
+        list.do_insert(3, 3f64, 1);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 4);
+        list.do_insert(37, 37f64, 3);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 5);
+        list.clear();
+        assert_eq!(list.length, 0);
+    }
+
+    #[test]
+    fn check_level() {
+        let mut list = Skiplist::new();
+        list.do_insert(22, 22f64, 1);
+        assert_eq!(list.level, 1);
+        assert_eq!(list.length, 1);
+        list.do_insert(19, 19f64, 2);
+        assert_eq!(list.level, 2);
+        assert_eq!(list.length, 2);
+        list.do_insert(7, 7f64, 4);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 3);
+        list.do_insert(3, 3f64, 1);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 4);
+        list.do_insert(37, 37f64, 3);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 5);
+        list.do_insert(11, 11f64, 1);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 6);
+        list.do_insert(26, 26f64, 1);
+        assert_eq!(list.level, 4);
+        assert_eq!(list.length, 7);
+        let r: Vec<(f64, &i32, usize)> = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(3f64, &3, 1), (7f64, &7, 4), (11f64, &11, 1), (19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1), (37f64, &37, 3)]);
+
+        let r = list.do_range_tuple(Some(18f64), None, 0, 3);
+        assert_eq!(r, vec![(19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1)]); 
+
+        let hit = list.do_find(3f64, &3).unwrap();
+        assert_eq!(hit.score, 3f64);
+        assert_eq!(hit.data, 3);
+        assert_eq!(hit.levels.len(), 1);
+        assert!(list.do_find(22f64, &0).is_none());
+
+        assert!(list.remove(3f64, &3));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(7f64, &7, 4), (11f64, &11, 1), (19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1), (37f64, &37, 3)]);
+
+        assert!(!list.remove(3f64, &3));
+        assert!(list.remove(11f64, &11));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(7f64, &7, 4), (19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1), (37f64, &37, 3)]);
+
+        assert!(list.remove(37f64, &37));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(7f64, &7, 4), (19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1)]);
+
+        assert!(!list.remove(37f64, &37));
+
+        assert!(list.remove(19f64, &19));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(7f64, &7, 4), (22f64, &22, 1), (26f64, &26, 1)]);
+
+        assert!(list.remove(26f64, &26));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(7f64, &7, 4), (22f64, &22, 1)]);
+
+        assert!(list.remove(7f64, &7));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![(22f64, &22, 1)]);
+
+        assert!(list.remove(22f64, &22));
+        let r = list.do_range_tuple(None, None, 0, 0);
+        assert_eq!(r, vec![]);
     }
 }
