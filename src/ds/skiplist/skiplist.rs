@@ -112,6 +112,20 @@ impl<T> RangeItem<T> {
 }
 
 
+/// 边界
+struct Bound {
+    /// 边界分数
+    bound: f64,
+    /// 是否排除边界
+    exclusive: bool,
+}
+
+impl Bound {
+    fn new(bound: f64, exclusive: bool) -> Self {
+        Self { bound, exclusive }
+    }
+}
+
 impl<Member> Skiplist<Member>
 where Member: Ord 
 {
@@ -380,14 +394,14 @@ where Member: Ord
         }
     }
 
-    fn do_range_tuple(&self, min: Option<f64>, max: Option<f64>, offset: usize, limit: usize) -> Vec<(f64, &Member, usize)> {
+    fn do_range_tuple(&self, min: Option<Bound>, max: Option<Bound>, offset: usize, limit: usize) -> Vec<(f64, &Member, usize)> {
         self.do_range(min, max, offset, limit)
             .into_iter()
             .map(|i| (i.score, i.data, i.skiplevel))
             .collect()
     }
 
-    fn do_range(&self, min: Option<f64>, max: Option<f64>, mut offset: usize, mut limit: usize) -> Vec<RangeItem<&Member>> {
+    fn do_range(&self, min: Option<Bound>, max: Option<Bound>, mut offset: usize, mut limit: usize) -> Vec<RangeItem<&Member>> {
         if limit == 0 {
             limit = usize::MAX;
         }
@@ -396,7 +410,7 @@ where Member: Ord
             return result
         }
         let mut first = self.level_links[0];
-        if let Some(min_score) = min {
+        if let Some(min) = min {
             let mut slow: *mut Node<Member> = std::ptr::null_mut();
             'out: for level in (0..self.level).rev() {
                 let mut next = if slow.is_null() {
@@ -408,7 +422,14 @@ where Member: Ord
                 };
                 while !next.is_null() {
                     let next_score = unsafe{(*next).score};
-                    if min_score <= next_score {
+                    if (next_score < min.bound) || (next_score == min.bound && min.exclusive) {
+                        // 起始点在下一个区间
+                        slow = next;
+                        next = unsafe {
+                            (*slow).levels[level]
+                        };
+                        continue
+                    } else {
                         // 起始点在范围内
                         if level > 0 {
                             continue 'out;
@@ -420,7 +441,7 @@ where Member: Ord
                         first = next;
                         while !pre.is_null() {
                             let pre_score = unsafe {(*pre).score};
-                            if pre_score >= min_score {
+                            if pre_score > min.bound || (pre_score == min.bound && !min.exclusive) {
                                 first = pre;
                                 pre = unsafe{ (*pre).backward };
                                 continue;
@@ -429,12 +450,6 @@ where Member: Ord
                             }
                         }
                         break 'out;
-                    } else {
-                        // 起始点在下一个区间
-                        slow = next;
-                        next = unsafe {
-                            (*slow).levels[level]
-                        };
                     }
                 }
             }
@@ -449,8 +464,9 @@ where Member: Ord
             if limit == 0 {
                 break;
             }
-            if let Some(m) = max {
-                if m < unsafe{(*cursor).score} {
+            if let Some(ref m) = max {
+                let cur_score = unsafe {(*cursor).score};
+                if (cur_score > m.bound) || (m.exclusive && cur_score == m.bound) {
                     break;
                 }
             }
@@ -479,6 +495,8 @@ impl<Member: PartialEq> Node<Member> {
 
 #[cfg(test)]
 mod test {
+    use crate::ds::skiplist::skiplist::Bound;
+
     use super::Skiplist;
 
     #[test]
@@ -546,8 +564,14 @@ mod test {
         let r: Vec<(f64, &i32, usize)> = list.do_range_tuple(None, None, 0, 0);
         assert_eq!(r, vec![(3f64, &3, 1), (7f64, &7, 4), (11f64, &11, 1), (19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1), (37f64, &37, 3)]);
 
-        let r = list.do_range_tuple(Some(18f64), None, 0, 3);
+        let r = list.do_range_tuple(Some(Bound::new(19f64, false)), None, 0, 3);
         assert_eq!(r, vec![(19f64, &19, 2), (22f64, &22, 1), (26f64, &26, 1)]); 
+
+        let r = list.do_range_tuple(Some(Bound::new(19f64, false)), None, 1, 2);
+        assert_eq!(r, vec![(22f64, &22, 1), (26f64, &26, 1)]); 
+
+        let r = list.do_range_tuple(Some(Bound::new(19f64, false)), Some(Bound::new(22f64, false)), 0, 3);
+        assert_eq!(r, vec![(19f64, &19, 2), (22f64, &22, 1)]); 
 
         let hit = list.do_find(3f64, &3).unwrap();
         assert_eq!(hit.score, 3f64);
