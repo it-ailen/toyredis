@@ -48,7 +48,7 @@ impl SDS {
             // 已经够了
             return;
         }
-        let mut new_size = (required_len + self.cur_len);
+        let mut new_size = required_len + self.cur_len;
         if 2*new_size <= MAX_PREALLOC {
             new_size *= 2;
         } else {

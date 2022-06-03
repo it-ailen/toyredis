@@ -146,8 +146,10 @@ impl <V: Default, S: BuildHasher + Clone> Dict<V, S> {
     /// 查找 value
     /// # Example
     /// ```
-    ///     let d = Dict::new();
-    ///     d.insert(super::perfstr::sds::SDS::new("key"))
+    ///     use toyredis::ds::dict::Dict;
+    ///     use toyredis::ds::perfstr::sds::SDS;
+    ///     let mut d = Dict::new();
+    ///     let _ = d.insert(SDS::new("key".as_bytes()), 1);
     /// ```
     pub fn get(&mut self, key: &SDS) -> Option<&V> {
         if self.value_cnt() == 0 {

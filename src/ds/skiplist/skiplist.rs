@@ -1,5 +1,4 @@
-use std::{rc::Rc, cell::{Cell, RefCell}, borrow::{BorrowMut, Borrow}, iter::Skip};
-use rand::{self, Rng};
+use rand::Rng;
 use core::cmp::Ordering;
 use std::fmt::Debug;
 
@@ -11,6 +10,8 @@ pub struct Skiplist<Member: PartialEq> {
     // tail: *mut Node<Member>,
     /// 各层的链表头
     level_links: Vec<*mut Node<Member>>,
+    /// 各层距离下一个节点的距离（中间的节点数）。这是为了提高查找效率
+    level_spans: Vec<usize>,
     /// skiplist 的层级
     level: usize,
     /// 快表中的长度，即 level-0 中的节点数
@@ -18,19 +19,6 @@ pub struct Skiplist<Member: PartialEq> {
     /// 随机跳跃的概率，取值在 0~100 之间
     skip_percentage: usize,
 }
-
-// impl<T: PartialEq + Debug> Debug for Skiplist<T> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         let res = f.debug_struct("Skiplist")
-//             .field("length", &self.length)
-//             .field("level", &self.level);
-        
-        
-//         f.debug_struct("Skiplist").field("level_links", &self.level_links).field("level", &self.level).field("length", &self.length).field("skip_percentage", &self.skip_percentage).finish()
-//     }
-// }
-
-// type Node<Member> = Rc<RefCell<SkiplistNode<Member>>>;
 
 const MAX_LEVELS: usize = 32;
 const DEFAULT_SKIP_PERCENTAGE: usize = 25;
@@ -42,6 +30,8 @@ struct Node<Member: PartialEq> {
     pub data: Member,
     /// 各层链表。层级越高，索引级别越高。
     pub levels: Vec<*mut Node<Member>>,
+    /// 距离同层下个节点间的距离（中间的节点数）。这是为了提高查找效率
+    spans: Vec<usize>,
     /// 指向前一个节点
     pub backward: *mut Node<Member>,
 }
@@ -84,15 +74,12 @@ impl<M: PartialEq> Drop for Skiplist<M> {
             let tail = unsafe {(*next).levels[0]};
             unsafe {
                 (*next).backward = std::ptr::null_mut();
-                (*next).levels = vec![];
                 let _ = Box::from_raw(next);
             }
             next = tail;
             self.length -=1;
         }
         assert_eq!(self.length, 0);
-        self.level = 0;
-        self.level_links = vec![];
     }
 }
 
@@ -113,7 +100,7 @@ impl<T> RangeItem<T> {
 
 
 /// 边界
-struct Bound {
+pub struct Bound {
     /// 边界分数
     bound: f64,
     /// 是否排除边界
@@ -121,8 +108,20 @@ struct Bound {
 }
 
 impl Bound {
-    fn new(bound: f64, exclusive: bool) -> Self {
+    pub fn new(bound: f64, exclusive: bool) -> Self {
         Self { bound, exclusive }
+    }
+
+    pub fn new_exclusive(bound: f64) -> Self {
+        Self { bound, exclusive: true }
+    }
+
+    pub fn new_inclusive(bound: f64) -> Self {
+        Self { bound, exclusive: false }
+    }
+
+    fn toggle(&self) -> Self {
+        Self { exclusive: !self.exclusive, ..(*self) }
     }
 }
 
@@ -137,6 +136,7 @@ where Member: Ord
             level: 0, 
             length: 0,
             skip_percentage: DEFAULT_SKIP_PERCENTAGE,
+            level_spans: vec![],
         }
     }
 
@@ -152,10 +152,10 @@ where Member: Ord
 
     pub fn insert(&mut self, data: Member, score: f64) {
         let level = self.random_level();
-        self.do_insert(data, score, level)
+        self.do_insert(data, score, level);
     }
 
-    fn do_insert(&mut self, data: Member, score: f64, level: usize) {
+    fn do_insert(&mut self, data: Member, score: f64, level: usize) -> Option<*mut Node<Member>> {
         // empty skiplist, insert node directly
         let new_node  = Box::new(Node::new(data, score, level));
         // 消费掉 Box 外壳，并返回内部数据指针。这是 rust 主动分配堆数据的经典操作
@@ -164,15 +164,18 @@ where Member: Ord
             // 补充链表头，新增的 level 直接从头指向
             self.level_links
                 .push(new_node);
+            // for new levels, set length as initial span
+            self.level_spans
+                .push(self.length);
         }
         if self.length == 0 {
             // 原来为空，直接加上
             self.length += 1;
             self.level = level;
-            return
+            return Some(new_node);
         }
-        // find position first
-        let mut slow: *mut Node<Member> = std::ptr::null_mut();// 指向上一个，空表示在 skiplist 起点
+        // 指向上一个，空表示在 skiplist 起点
+        let mut slow: *mut Node<Member> = std::ptr::null_mut();
         'out: for level_cursor in (0..level.min(self.level)).rev() {
             let mut next = if slow.is_null() {
                 self.level_links[level_cursor]
@@ -218,7 +221,7 @@ where Member: Ord
                     },
                     Ordering::Equal => {
                         // 不允许重复插入
-                        return;
+                        return None;
                     },
                     _ => {
                         // 后一个区间，slow 就移位
@@ -245,10 +248,87 @@ where Member: Ord
                 }
             }
         }
+        // 修正 span
+        'out2: for level_cursor in 1..level {
+            let mut slow: *mut Node<Member> = std::ptr::null_mut();
+            let mut slow_span = self.level_spans[level_cursor];
+            let mut next = self.level_links[level_cursor];
+            loop {
+                if next as u64 == new_node as u64 {
+                    // 已经到达最后一个
+                    let mut pre = unsafe {
+                        (*new_node).backward
+                    };
+                    let mut span_before = 0;
+                    while !pre.is_null() && pre != slow {
+                        pre = unsafe {
+                            (*pre).backward
+                        };
+                        span_before += 1;
+                    }
+                    let span_after = slow_span - span_before;
+                    unsafe {
+                        (*new_node).spans[level_cursor] = span_after;
+                    }
+                    if slow.is_null() {
+                        self.level_spans[level_cursor] = span_before;
+                    } else {
+                        unsafe {
+                            (*slow).spans[level_cursor] = span_before;
+                        }
+                    }
+                    continue 'out2;
+                } else {
+                    slow = next;
+                    slow_span = unsafe {
+                        (*slow).spans[level_cursor]
+                    };
+                    next = unsafe {
+                        (*next).levels[level_cursor]
+                    };
+                }
+            }
+        }
+        // for the upper levels, the inserted item will only influence the span of ranges
+        'out3: for level_cursor in level..self.level {
+            let mut slow: *mut Node<Member> = std::ptr::null_mut();
+            let mut next = if slow.is_null() {
+                self.level_links[level_cursor]
+            } else {
+                unsafe {
+                    (*slow).levels[level_cursor]
+                }
+            };
+            while !next.is_null() {
+                if unsafe {*new_node < *next} {
+                    if slow.is_null() {
+                        self.level_spans[level_cursor] += 1;
+                    } else {
+                        unsafe {
+                            (*slow).spans[level_cursor] += 1;
+                        }
+                    }
+                    continue 'out3;
+                } else {
+                    slow = next;
+                    next = unsafe {
+                        (*next).levels[level_cursor]
+                    };
+                }
+            }
+            if slow.is_null() {
+                self.level_spans[level_cursor] += 1;
+            } else {
+                unsafe {
+                    (*slow).spans[level_cursor] += 1;
+                }
+            } 
+        }
         self.length += 1;
         if level > self.level {
             self.level = level;
         }
+        Some(new_node)
     }
 
     fn do_find(&self, score: f64, data: &Member) -> Option<&Node<Member>> {
@@ -313,6 +393,7 @@ where Member: Ord
             self.level_links[0] = node.levels[0];
         }
         self.level_links.clear();
+        self.level_spans.clear();
         count
     }
 
@@ -320,6 +401,7 @@ where Member: Ord
         if self.length == 0 {
             return false;
         }
+        let mut to_remove: *mut Node<Member> = std::ptr::null_mut();
         let mut slow: *mut Node<Member> = std::ptr::null_mut();
         'out: for cur_level in (0..self.level).rev() {
             let mut next = if slow.is_null() {
@@ -362,8 +444,9 @@ where Member: Ord
                                 }
                             }
                             self.length -= 1;
-                            let _ = unsafe {Box::from_raw(next)}; // 清除
-                            return true
+                            // found it
+                            to_remove = next;
+                            break 'out;
                         }
                         continue 'out;
                     },
@@ -376,6 +459,65 @@ where Member: Ord
                     },
                 }
             }
+        }
+        // amend span now
+        if !to_remove.is_null() {
+            // found it, remove now
+            let item_level = unsafe {
+                (*to_remove).levels.len()
+            };
+            for level in 1..item_level {
+                // null for the start list
+                let span_after = unsafe {
+                    (*to_remove).spans[level]
+                };
+                let mut slow: *mut Node<Member> = std::ptr::null_mut(); 
+                let mut next = self.level_links[level];
+                loop {
+                    if next.is_null() || unsafe{*next > *to_remove} {
+                        // the item to remove is the tail of this level, just update the span;
+                        // or it is in current range (slow, next)
+                        if slow.is_null() {
+                            self.level_spans[level] += span_after;
+                        } else {
+                            unsafe {
+                                (*slow).spans[level] += span_after;
+                            }
+                        };
+                        break;
+                    } else {
+                        slow = next;
+                        next = unsafe {
+                            (*slow).levels[level]
+                        };
+                    }
+                }
+            }
+            for level in item_level..self.level {
+                let mut slow: *mut Node<Member> = std::ptr::null_mut();
+                let mut next = self.level_links[level];
+                loop {
+                    if next.is_null() || unsafe{*next > *to_remove} {
+                        // the item to remove is the tail of this level, just update the span;
+                        // or it is in current range (slow, next)
+                        if slow.is_null() {
+                            self.level_spans[level] -= 1;
+                        } else {
+                            unsafe {
+                                (*slow).spans[level] -= 1;
+                            }
+                        };
+                        break;
+                    } else {
+                        slow = next;
+                        next = unsafe {
+                            (*slow).levels[level]
+                        };
+                    }
+                }
+            }
+            let _ = unsafe{Box::from_raw(to_remove)};
+            return true
         }
         false
     }
@@ -399,6 +541,53 @@ where Member: Ord
             .into_iter()
             .map(|i| (i.score, i.data, i.skiplevel))
             .collect()
+    }
+
+    fn count_element_upto(&self, up: &Bound) -> usize {
+        let mut count = 0;
+        let mut slow: *mut Node<Member> = std::ptr::null_mut();
+        'out: for level in (0..self.level).rev() {
+            let mut next = if slow.is_null() {
+                self.level_links[level]
+            } else {
+                unsafe {
+                    (*slow).levels[level]
+                }
+            };
+            while !next.is_null() {
+                let next_score = unsafe {
+                    (*next).score
+                };
+                let span = if slow.is_null() {
+                    self.level_spans[level]
+                } else {
+                    unsafe {
+                        (*slow).spans[level]
+                    }
+                };
+                if next_score > up.bound || (up.bound == next_score && up.exclusive) {
+                    // 当前区间内，查找下一层
+                    continue 'out;
+                } else {
+                    count += span + 1;
+                    slow = next;
+                    next = unsafe {
+                        (*slow).levels[level]
+                    };
+                }
+            }
+        }
+        count
+    }
+
+    /// 获取指定范围内的数据量，支持 `zcount (start end` 操作
+    pub fn range_count(&self, min: Option<Bound>, max: Option<Bound>) -> usize {
+        match (min, max) {
+            (None, None) => self.length,
+            (None, Some(max)) => self.count_element_upto(&max),
+            (Some(min), None) => self.length - self.count_element_upto(&min.toggle()),
+            (Some(min), Some(max)) => self.count_element_upto(&max) - self.count_element_upto(&min.toggle()),
+        }
     }
 
     fn do_range(&self, min: Option<Bound>, max: Option<Bound>, mut offset: usize, mut limit: usize) -> Vec<RangeItem<&Member>> {
@@ -489,6 +678,7 @@ impl<Member: PartialEq> Node<Member> {
             data,
             levels: vec![std::ptr::null_mut(); level],
             backward: std::ptr::null_mut(),
+            spans: vec![0; level],
         }
     }
 }
@@ -513,6 +703,107 @@ mod test {
         assert!(list.remove(2f64, &2));
         assert_eq!(list.length, 0);
         assert_eq!(list.level, 2);
+    }
+
+    #[test]
+    fn check_span() {
+        let mut list = Skiplist::new();
+        let inserted_22 = list.do_insert(22, 22f64, 1).unwrap();
+        for level in 0..list.level {
+            assert_eq!(list.level_spans[level], 0);
+            assert_eq!(unsafe{(*inserted_22).spans[level]}, 0);
+        }
+        let inserted_19 = list.do_insert(19, 19f64, 2).unwrap();
+        assert_eq!(unsafe {
+            (*inserted_19).spans[0]
+        }, 0);
+        assert_eq!(unsafe{(*inserted_19).spans[1]}, 1);
+        let inserted_7 = list.do_insert(7, 7f64, 4).unwrap();
+        assert_eq!(unsafe{(*inserted_7).spans[0]}, 0);
+        assert_eq!(unsafe{(*inserted_7).spans[1]}, 0);
+        assert_eq!(unsafe{(*inserted_7).spans[2]}, 2);
+        assert_eq!(unsafe{(*inserted_7).spans[3]}, 2);
+        let inserted_3 = list.do_insert(3, 3f64, 1);
+        assert_eq!(list.level_spans[0], 0);
+        assert_eq!(list.level_spans[1], 1);
+        assert_eq!(list.level_spans[2], 1);
+        assert_eq!(list.level_spans[3], 1);
+        let inserted_37 = list.do_insert(37, 37f64, 3).unwrap();
+        for l in 0..3 {
+            assert_eq!(unsafe{(*inserted_37).spans[l]}, 0);
+        }
+        assert_eq!(unsafe{(*inserted_19).spans[1]}, 1);
+        assert_eq!(unsafe{(*inserted_7).spans[2]}, 2);
+        assert_eq!(unsafe{(*inserted_7).spans[3]}, 3);
+
+        let inserted_11 = list.do_insert(11, 11f64, 1).unwrap();
+        assert_eq!(unsafe{(*inserted_7).spans[1]}, 1);
+        assert_eq!(unsafe{(*inserted_7).spans[2]}, 3);
+        assert_eq!(unsafe{(*inserted_7).spans[3]}, 4);
+
+        list.do_insert(26, 26f64, 1);
+        assert_eq!(unsafe{(*inserted_19).spans[1]}, 2);
+        assert_eq!(unsafe{(*inserted_7).spans[2]}, 4);
+        assert_eq!(unsafe{(*inserted_7).spans[3]}, 5);
+
+        // (-inf, 3]
+        assert_eq!(list.count_element_upto(&Bound::new_inclusive(3f64)), 1);
+        assert_eq!(list.count_element_upto(&Bound::new_exclusive(3f64)), 0);
+        assert_eq!(list.count_element_upto(&Bound::new_inclusive(7f64)), 2);
+        assert_eq!(list.count_element_upto(&Bound::new_exclusive(7f64)), 1);
+        assert_eq!(list.count_element_upto(&Bound::new_inclusive(11f64)), 3);
+        assert_eq!(list.count_element_upto(&Bound::new_exclusive(11f64)), 2);
+        assert_eq!(list.count_element_upto(&Bound::new_inclusive(19f64)), 4);
+        assert_eq!(list.count_element_upto(&Bound::new_exclusive(19f64)), 3);
+
+        // [3, 19)]
+        assert_eq!(
+            list.range_count(
+                Some(Bound::new_inclusive(3f64)), 
+                Some(Bound::new_exclusive(19f64))
+        ), 3);
+        // (3, 22)
+        assert_eq!(
+            list.range_count(
+                Some(Bound::new_exclusive(3f64)), 
+                Some(Bound::new_exclusive(22f64))
+        ), 3);
+        // [4, +inf)
+        assert_eq!(
+            list.range_count(
+                Some(Bound::new_inclusive(4f64)), 
+                None
+        ), 6);
+
+        // (-inf, inf)
+        assert_eq!(
+            list.range_count(
+                None,
+                None
+        ), list.length);
+        // remove and check span again
+        list.remove(22f64, &22);
+        assert_eq!(unsafe{(*inserted_19).spans[1]}, 1);
+        assert_eq!(unsafe{(*inserted_7).spans[2]}, 3);
+        assert_eq!(unsafe{(*inserted_7).spans[3]}, 4);
+
+        list.remove(7f64, &7);
+        assert_eq!(list.level_spans[1], 2);
+        assert_eq!(list.level_spans[2], 4);
+        assert_eq!(list.level_spans[3], 5);
+
+        list.remove(37f64, &37);
+        assert_eq!(unsafe{(*inserted_19).spans[1]}, 1);
+        assert_eq!(list.level_spans[2], 4);
+        assert_eq!(list.level_spans[3], 4);
+
+        // [4, +inf)
+        assert_eq!(
+            list.range_count(
+                Some(Bound::new_inclusive(4f64)), 
+                None
+        ), 3); 
+        
     }
 
     #[test]
@@ -572,6 +863,9 @@ mod test {
 
         let r = list.do_range_tuple(Some(Bound::new(19f64, false)), Some(Bound::new(22f64, false)), 0, 3);
         assert_eq!(r, vec![(19f64, &19, 2), (22f64, &22, 1)]); 
+
+        let r = list.do_range_tuple(Some(Bound::new(19f64, false)), Some(Bound::new(22f64, true)), 0, 3);
+        assert_eq!(r, vec![(19f64, &19, 2)]); 
 
         let hit = list.do_find(3f64, &3).unwrap();
         assert_eq!(hit.score, 3f64);
